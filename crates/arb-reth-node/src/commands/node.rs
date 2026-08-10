@@ -697,7 +697,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                         while let Some(frame) = ws.next().await {
                             // This is the ingress edge: take the timestamp before converting or
                             // parsing the WebSocket frame so the metric includes that work too.
+                            // The wall clock is taken at the same edge because it is the only
+                            // point comparable with the sequencer's own stamp; everything after
+                            // this stays on the monotonic clock.
                             let frame_received_at = std::time::Instant::now();
+                            let frame_received_wall = std::time::SystemTime::now();
                             let text = match frame {
                                 Ok(Message::Text(t)) => t.as_str().to_owned(),
                                 Ok(Message::Binary(b)) => match core::str::from_utf8(b.as_ref()) {
@@ -723,6 +727,11 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                                         feed_latency.record_frame_arrival(
                                             msg.sequence_number,
                                             frame_received_at,
+                                            frame_received_wall,
+                                            msg.message_with_meta_data
+                                                .l1_incoming_message
+                                                .header
+                                                .timestamp,
                                         );
                                         feed_latency.record_ready_for_channel(
                                             msg.sequence_number,

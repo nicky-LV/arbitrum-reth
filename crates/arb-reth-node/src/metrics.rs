@@ -8,7 +8,7 @@ use reth_metrics::{
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_TRACKED_MESSAGES: usize = 16_384;
@@ -18,7 +18,16 @@ const MAX_TRACKED_MESSAGES: usize = 16_384;
 #[derive(Metrics)]
 #[metrics(scope = "arb_reth.feed")]
 struct FeedLatencyMetrics {
-    /// Time from receiving a sequencer-feed WebSocket frame to canonical in-memory state.
+    /// sequenced2state: time from the sequencer's own message timestamp to canonical in-memory
+    /// state on this node. The sequencer stamps whole seconds, so every sample carries the
+    /// sub-second remainder of its stamp as a positive bias; the minimum over a window is the
+    /// tightest estimate of the true latency, and the mean sits roughly half a block-second high.
+    sequenced_to_state_seconds: Histogram,
+    /// sequenced2received: the sequencer-to-node half of sequenced2state, carrying the same
+    /// whole-second stamping bias. sequenced2state minus this is exactly `frame_to_canonical`.
+    sequenced_to_received_seconds: Histogram,
+    /// received2state: time from receiving a sequencer-feed WebSocket frame to canonical in-memory
+    /// state. Both edges are local monotonic instants, so this half is exact.
     frame_to_canonical_seconds: Histogram,
     /// WebSocket text/binary conversion and JSON decoding before a message is ready for the channel.
     frame_decode_seconds: Histogram,
@@ -102,6 +111,12 @@ struct FeedLatencyInner {
 #[derive(Clone, Copy)]
 struct FeedMessageTiming {
     frame_received_at: Instant,
+    /// Wall clock taken at the same edge as `frame_received_at`, the only point where this node's
+    /// clock and the sequencer's stamp can be compared. Later phases are measured monotonically
+    /// from `frame_received_at`, so a clock step cannot distort them.
+    frame_received_wall: SystemTime,
+    /// Seconds-granularity timestamp the sequencer stamped on this message.
+    sequenced_at_secs: u64,
     ready_for_channel_at: Option<Instant>,
     driver_dequeued_at: Option<Instant>,
 }
@@ -124,8 +139,15 @@ impl FeedLatencyTracker {
         }
     }
 
-    /// Records the instant at which a WebSocket data frame was received, before parsing it.
-    pub(crate) fn record_frame_arrival(&self, sequence_number: u64, received_at: Instant) {
+    /// Records the instant at which a WebSocket data frame was received, before parsing it, along
+    /// with the wall clock at that same edge and the sequencer's stamp for this message.
+    pub(crate) fn record_frame_arrival(
+        &self,
+        sequence_number: u64,
+        received_at: Instant,
+        received_wall: SystemTime,
+        sequenced_at_secs: u64,
+    ) {
         let mut messages = match self.inner.messages.try_lock() {
             Ok(messages) => messages,
             Err(_) => {
@@ -147,6 +169,8 @@ impl FeedLatencyTracker {
             sequence_number,
             FeedMessageTiming {
                 frame_received_at: received_at,
+                frame_received_wall: received_wall,
+                sequenced_at_secs,
                 ready_for_channel_at: None,
                 driver_dequeued_at: None,
             },
@@ -195,12 +219,26 @@ impl FeedLatencyTracker {
 
         if let Some(timing) = timing {
             let metrics = self.metrics();
-            metrics.frame_to_canonical_seconds.record(
-                applied
-                    .completed_at
-                    .saturating_duration_since(timing.frame_received_at)
-                    .as_secs_f64(),
-            );
+            let received_to_state = applied
+                .completed_at
+                .saturating_duration_since(timing.frame_received_at)
+                .as_secs_f64();
+            metrics.frame_to_canonical_seconds.record(received_to_state);
+            // The sequencer stamp is wall-clock, so this is the one span that has to cross clock
+            // domains; every later phase stays on the monotonic clock. A zero stamp means the
+            // message carried none (L1-derived or synthetic), which would otherwise read as
+            // decades of latency.
+            if timing.sequenced_at_secs != 0
+                && let Some(sequenced_to_received) =
+                    sequenced_to_received_secs(timing.frame_received_wall, timing.sequenced_at_secs)
+            {
+                metrics
+                    .sequenced_to_received_seconds
+                    .record(sequenced_to_received);
+                metrics
+                    .sequenced_to_state_seconds
+                    .record(sequenced_to_received + received_to_state);
+            }
             if let Some(ready_at) = timing.ready_for_channel_at {
                 metrics.frame_decode_seconds.record(
                     ready_at
@@ -338,5 +376,49 @@ impl FeedLatencyTracker {
         // The live-feed task starts only after `with_prometheus_server` has installed reth's
         // recorder, so metric handles are never initialized against the no-op recorder.
         self.inner.metrics.get_or_init(FeedLatencyMetrics::default)
+    }
+}
+
+/// Seconds from the sequencer's stamp to local ingress. Signed: a negative result means this
+/// node's clock trails the sequencer's, which is a real condition worth surfacing rather than
+/// clamping to zero. The stamp itself is truncated to whole seconds by the sequencer, so the
+/// result also carries that message's sub-second remainder as a positive bias.
+/// `None` only if the system clock is set before 1970, where no sample is better than a bogus one.
+fn sequenced_to_received_secs(received_wall: SystemTime, sequenced_at_secs: u64) -> Option<f64> {
+    let received_epoch = received_wall.duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
+    Some(received_epoch - sequenced_at_secs as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wall(secs_since_epoch: f64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs_f64(secs_since_epoch)
+    }
+
+    #[track_caller]
+    fn offset(received: f64, stamp: u64) -> f64 {
+        sequenced_to_received_secs(wall(received), stamp).expect("post-1970 clock")
+    }
+
+    #[test]
+    fn sequenced_to_received_is_the_sub_second_offset_from_the_stamp() {
+        // The sequencer stamped 1_786_294_297; the frame landed 250ms into that second.
+        let offset = offset(1_786_294_297.25, 1_786_294_297);
+        assert!((offset - 0.25).abs() < 1e-9, "{offset}");
+    }
+
+    #[test]
+    fn sequenced_to_received_spans_whole_seconds() {
+        let offset = offset(1_786_294_299.5, 1_786_294_297);
+        assert!((offset - 2.5).abs() < 1e-9, "{offset}");
+    }
+
+    #[test]
+    fn sequenced_to_received_is_negative_when_the_local_clock_trails() {
+        let offset = offset(1_786_294_296.75, 1_786_294_297);
+        assert!((offset + 0.25).abs() < 1e-9, "{offset}");
     }
 }

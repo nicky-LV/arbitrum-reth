@@ -8,9 +8,17 @@ arb-reth node --metrics 127.0.0.1:9001 ...
 
 The endpoint includes reth engine-tree, persistence, state-root, and RPC metrics. With `--feed-url`, arb-reth also records the live sequencer path. Telemetry deliberately drops a sample instead of blocking the feed reader or block producer.
 
+## Sequencer to state
+
+`reth_arb_reth_feed_sequenced_to_state_seconds` (sequenced2state) measures from the timestamp the sequencer stamped on a message to the moment its block is this node's canonical in-memory head — the age of the state an off-node consumer acts on. `reth_arb_reth_feed_sequenced_to_received_seconds` is the sequencer-to-ingress half of it; the remainder is exactly `frame_to_canonical_seconds` below.
+
+The sequencer stamps whole seconds, so both `sequenced_*` series carry the sub-second remainder of the stamp as a positive bias of up to one second. Read `quantile="0"` as the tightest estimate of the true latency; the mean sits roughly half a stamping second high. `frame_to_canonical_seconds` has no such bias, because both of its edges are local monotonic instants.
+
+A negative sample means this node's clock trails the sequencer's — the series is signed rather than clamped so that stays visible. Messages that carry no stamp (L1-derived, replay) are not sampled.
+
 ## Feed to canonical state
 
-`reth_arb_reth_feed_frame_to_canonical_seconds` measures from receiving a WebSocket data frame through decoding, queueing, block production, forkchoice, and in-memory canonicalization. It ends when the shared provider state used by RPC has the new canonical head. It does not include an RPC client's network round trip or response serialization.
+`reth_arb_reth_feed_frame_to_canonical_seconds` (received2state) measures from receiving a WebSocket data frame through decoding, queueing, block production, forkchoice, and in-memory canonicalization. It ends when the shared provider state used by RPC has the new canonical head. It does not include an RPC client's network round trip or response serialization.
 
 Use the phase metrics to locate the delay:
 
