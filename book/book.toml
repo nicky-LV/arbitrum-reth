@@ -1,0 +1,30 @@
+[book]
+title = "The arbitrum-reth Book"
+authors = ["nun"]
+description = "How arbitrum-reth reads Arbitrum messages, executes ArbOS, and serves the resulting state."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/nuntax/arbitrum-reth"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/nuntax/arbitrum-reth/edit/main/book/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true
+
+[output.html.playground]
+runnable = false

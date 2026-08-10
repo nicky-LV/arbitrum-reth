@@ -11,3 +11,5 @@ Use the release binary in the examples below. Replace paths and endpoints with v
 - [observability](observability/README.md): Prometheus metrics for the execute and persist loop.
 
 Every command exposes its complete flag list through `arb-reth <command> --help`.
+
+For how the node works internally rather than how to invoke it, see [The arbitrum-reth Book](../book/); run `./open_book.sh` at the repository root to serve it.

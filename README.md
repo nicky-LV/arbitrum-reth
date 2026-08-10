@@ -80,6 +80,19 @@ For a complete Robinhood mainnet invocation, see the [Robinhood chain guide](doc
 
 The command index is in [docs](docs/README.md). The CLI is the source of truth for flags: `arbitrum-reth <command> --help`.
 
+## The book
+
+[The arbitrum-reth Book](book/) explains how the node works internally: how it gets transactions from the
+sequencer (relay feed and L1 derivation), how it applies them (ArbOS execution through reth's engine tree),
+and how it makes the resulting state available (persistence and RPC).
+
+```sh
+./open_book.sh          # serve with live reload on 127.0.0.1:3001, or the next free port
+./open_book.sh build    # render static HTML into book/book/
+```
+
+The chapter sources are under [`book/src`](book/src) and are readable as plain Markdown.
+
 ## Workspace layout
 
 - `arbitrum-reth-derive`: batch, delayed-inbox, brotli, and blob decoding.
