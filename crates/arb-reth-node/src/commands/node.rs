@@ -114,6 +114,14 @@ pub struct NodeArgs {
     )]
     share_sparse_trie_with_payload_builder: bool,
 
+    /// Keep the sparse trie's cached nodes across blocks instead of pruning them every epoch.
+    ///
+    /// Only meaningful together with `--share-sparse-trie-with-payload-builder`, which is what
+    /// preserves the trie between state-root jobs. Buys trie-cache hit rate with resident memory;
+    /// suited to a node that follows one tip and never reorgs deeply.
+    #[arg(long = "disable-sparse-trie-cache-pruning", default_value_t = false)]
+    disable_sparse_trie_cache_pruning: bool,
+
     /// Open MDBX in `SafeNoSync` durability mode: skip the per-commit fsync during bulk
     /// historical sync. Each block still commits to MDBX (so the parent state is visible to the
     /// child), but the OS flushes lazily, cutting ~50ms fsync latency off every block. Stays
@@ -228,6 +236,15 @@ pub struct NodeArgs {
     /// tip header's nonce (`delayedMessagesRead`), so it normally need not be supplied.
     #[arg(long = "l1-start-delayed")]
     l1_start_delayed: Option<u64>,
+
+    /// L2 block the --l1-start-block boundary sits AFTER (the numbering anchor for derived
+    /// messages). Optional override: defaults to the durable DB tip, which is correct when the
+    /// start block is the batch boundary the tip was built from. Set it when the tip lies
+    /// MID-batch (e.g. a snapshot cut inside a batch): pass the batch's first message index minus
+    /// one; re-derived blocks at or below the DB tip are dropped, so derivation aligns without
+    /// rewinding below the snapshot genesis.
+    #[arg(long = "l1-start-l2-block", requires = "l1_start_block")]
+    l1_start_l2_block: Option<u64>,
 
     /// `SequencerInbox` contract address on L1. This and --l1-bridge are one rollup deployment:
     /// set both to target a custom chain (a nitro-testnode or an Orbit chain), or neither to use
@@ -591,6 +608,7 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
             share_execution_cache_with_payload_builder: args
                 .share_execution_cache_with_payload_builder,
             share_sparse_trie_with_payload_builder: args.share_sparse_trie_with_payload_builder,
+            disable_sparse_trie_cache_pruning: args.disable_sparse_trie_cache_pruning,
         },
         prune_config,
         messages: feed_rx,
@@ -809,8 +827,9 @@ pub async fn run(ctx: CliContext, args: NodeArgs) -> eyre::Result<()> {
                     )
                 })?,
             };
-            info!(target: "arb-reth", l1_block = b, delayed, l2_block = db_tip, "L1 resume point: --l1-start-block override");
-            (b, delayed, db_tip)
+            let anchor = args.l1_start_l2_block.unwrap_or(db_tip);
+            info!(target: "arb-reth", l1_block = b, delayed, l2_block = anchor, db_tip, "L1 resume point: --l1-start-block override");
+            (b, delayed, anchor)
         } else if let Some(log) = &resume_log {
             // Persisted log: resume from the newest boundary at or below the durable tip. Boundaries
             // are only logged once their blocks are durable, so normally that is the newest entry.

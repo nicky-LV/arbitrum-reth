@@ -62,7 +62,15 @@ impl BeaconClient {
     /// blob endpoint in particular returns sporadic 503s under load. Permanent failures (e.g. 404)
     /// and body-decode errors return immediately.
     pub async fn blob_sidecars(&self, slot: u64) -> Result<Vec<BlobSidecar>, L1Error> {
-        let url = format!("{}/eth/v1/beacon/blob_sidecars/{slot}", self.base);
+        // A base of the form `https://host/path?auth=key` keeps its query string
+        // after the appended REST path (`.../path/eth/v1/...?auth=key`).
+        let url = match self.base.split_once('?') {
+            Some((path, query)) => format!(
+                "{}/eth/v1/beacon/blob_sidecars/{slot}?{query}",
+                path.trim_end_matches('/')
+            ),
+            None => format!("{}/eth/v1/beacon/blob_sidecars/{slot}", self.base),
+        };
         const MAX_ATTEMPTS: u32 = 12;
         let mut backoff = std::time::Duration::from_millis(500);
         for attempt in 1..=MAX_ATTEMPTS {

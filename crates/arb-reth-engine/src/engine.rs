@@ -695,6 +695,12 @@ pub struct ArbEngineTuning {
     /// retain reth's conservative payload-builder behavior on hosts that may build payloads in
     /// parallel.
     pub share_sparse_trie_with_payload_builder: bool,
+    /// Keep the sparse trie's cached nodes across blocks instead of pruning them each epoch.
+    ///
+    /// Only has an effect alongside `share_sparse_trie_with_payload_builder`, which is what
+    /// preserves the trie between state-root jobs in the first place. Trades resident memory for
+    /// trie-cache hit rate, so it suits a node that follows one chain tip and never reorgs deeply.
+    pub disable_sparse_trie_cache_pruning: bool,
 }
 
 impl Default for ArbEngineTuning {
@@ -716,6 +722,7 @@ impl ArbEngineTuning {
             execution_cache_size: 256 * 1024 * 1024,
             share_execution_cache_with_payload_builder: true,
             share_sparse_trie_with_payload_builder: false,
+            disable_sparse_trie_cache_pruning: false,
         }
     }
 
@@ -734,6 +741,7 @@ impl ArbEngineTuning {
             .with_share_sparse_trie_with_payload_builder(
                 self.share_sparse_trie_with_payload_builder,
             )
+            .with_disable_sparse_trie_cache_pruning(self.disable_sparse_trie_cache_pruning)
     }
 }
 
@@ -1412,7 +1420,7 @@ where
             .resolve_kind(payload_id, PayloadKind::Earliest)
             .await
             .ok_or_else(|| eyre!("native payload job {payload_id:?} disappeared"))?
-            .map_err(|e| eyre!("native payload job {payload_id:?} failed: {e}"))?;
+            .map_err(|e| eyre!("native payload job {payload_id:?} failed: {e:?}"))?;
         let payload_job_resolve = payload_resolve_started_at.elapsed();
         let payload_job = payload_job_started_at.elapsed();
         let production_timing = payload.production_timing();
