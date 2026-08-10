@@ -12,9 +12,9 @@ create-missing = false
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/nuntax/arbitrum-reth"
+git-repository-url = "https://github.com/nicky-LV/arbitrum-reth"
 git-repository-icon = "fab-github"
-edit-url-template = "https://github.com/nuntax/arbitrum-reth/edit/main/book/{path}"
+edit-url-template = "https://github.com/nicky-LV/arbitrum-reth/edit/main/book/{path}"
 no-section-label = false
 
 [output.html.fold]

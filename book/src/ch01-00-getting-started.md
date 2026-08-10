@@ -6,7 +6,7 @@ rest of the book describes.
 
 This chapter covers building the binary and the shape of a `node` invocation. It is
 deliberately brief; the exhaustive flag reference is `arb-reth <command> --help` and the
-operator guides under [`docs/`](https://github.com/nuntax/arbitrum-reth/tree/main/docs).
+operator guides under [`docs/`](https://github.com/nicky-LV/arbitrum-reth/tree/main/docs).
 
 `arb-reth` is a single binary with five subcommands:
 

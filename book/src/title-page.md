@@ -9,7 +9,7 @@ This version of the text documents `arbitrum-reth` 0.1.0, built against the pinn
 > it to custody funds. Everything in this book describes how the code works today, not a
 > stability promise.
 
-The source for this book lives in the [`book/`](https://github.com/nuntax/arbitrum-reth/tree/main/book)
+The source for this book lives in the [`book/`](https://github.com/nicky-LV/arbitrum-reth/tree/main/book)
 directory of the repository. Operator-facing command references live separately under
-[`docs/`](https://github.com/nuntax/arbitrum-reth/tree/main/docs); this book explains the
+[`docs/`](https://github.com/nicky-LV/arbitrum-reth/tree/main/docs); this book explains the
 machinery behind them.
