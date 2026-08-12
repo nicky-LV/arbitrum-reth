@@ -11,6 +11,7 @@
 
 use core::{future::Future, pin::Pin};
 use std::net::SocketAddr;
+use std::time::UNIX_EPOCH;
 
 use crate::metrics::FeedLatencyTracker;
 use alloy_consensus::Header;
@@ -332,6 +333,10 @@ impl ArbLauncher {
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
         let mut messages_rx = messages;
 
+        // The driver task below takes `feed_latency`; keep a handle for the RPC hook so
+        // `arb_getFeedIngress` can serve the retained ingress stamps out of the same tracker.
+        let rpc_feed_latency = feed_latency.clone();
+
         task_executor.spawn_critical_task("arb-engine-driver", async move {
             let res: eyre::Result<()> = async {
                 // Bench accounting: separate time spent WAITING for the next derived feed
@@ -434,6 +439,43 @@ impl ArbLauncher {
                 jwt_secret: ctx.auth_jwt_secret()?,
             };
             let handle = crate::addons::arb_add_ons()
+                .extend_rpc_modules(move |ctx| {
+                    // `arb_getFeedIngress(blockNumber)`: the CLOCK_REALTIME stamp taken at the
+                    // websocket ingress edge for the frame that produced a block, plus its feed
+                    // sequence number. This is the node-side half of a cross-process latency
+                    // join: a consumer subtracts it from its own wall-clock send stamp for the
+                    // same block. Only a live feed has ingress stamps, so replay/L1-only nodes
+                    // (tracker absent) serve no method rather than a method of nulls.
+                    let Some(tracker) = rpc_feed_latency else {
+                        return Ok(());
+                    };
+                    let mut module = jsonrpsee::RpcModule::new(tracker);
+                    module.register_method("arb_getFeedIngress", |params, tracker, _| {
+                        let block_number: u64 = params.one()?;
+                        let Some((received_wall, sequence_number)) =
+                            tracker.feed_ingress(block_number)
+                        else {
+                            // Evicted, pre-restart, or never tracked: an absent join key is a
+                            // normal outcome for the consumer, not an error.
+                            return Ok(None);
+                        };
+                        // Nanos-since-epoch exceeds 2^53, so a JSON number would lose precision
+                        // in double-parsing clients; serve a decimal string. A pre-1970 clock
+                        // has no representable stamp, so it reads as absent too.
+                        let Ok(since_epoch) = received_wall.duration_since(UNIX_EPOCH) else {
+                            return Ok(None);
+                        };
+                        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(Some(serde_json::json!({
+                            "blockNumber": block_number,
+                            "sequenceNumber": sequence_number,
+                            "ingressUnixNanos": since_epoch.as_nanos().to_string(),
+                        })))
+                    })?;
+                    // Every configured transport: the low-latency consumer reads over the ipc
+                    // socket, while http/ws keep the method reachable for manual inspection.
+                    ctx.modules.merge_configured(module)?;
+                    Ok(())
+                })
                 .launch_add_ons(add_ons_ctx)
                 .await?;
             Some(handle.rpc_server_handles.rpc)

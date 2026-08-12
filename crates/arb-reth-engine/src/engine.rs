@@ -752,6 +752,9 @@ impl ArbEngineTuning {
 /// to MDBX remains asynchronous and is intentionally outside this critical-path measurement.
 #[derive(Debug, Clone, Copy)]
 pub struct ArbAppliedMessageTiming {
+    /// The produced block's number, so downstream consumers can join feed-ingress stamps to
+    /// blocks.
+    pub block_number: u64,
     /// Instant immediately before native payload attributes are constructed.
     pub started_at: Instant,
     /// Instant at which the produced block became canonical, before metric emission.
@@ -1779,6 +1782,7 @@ where
         );
 
         ArbAppliedMessageTiming {
+            block_number: new_number,
             started_at,
             completed_at,
             payload_attributes: payload_timing.attributes,

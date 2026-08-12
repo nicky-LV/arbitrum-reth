@@ -61,6 +61,10 @@ persistence, state-root, and feed-to-canonical metrics are never sampled by this
 
 Samples collected while catching up from a feed backlog include that backlog in the end-to-end measurement. Use a node at the live tip to judge MEV-facing latency.
 
+## Per-block ingress lookup
+
+With `--feed-url` and `--http`, the node also serves `arb_getFeedIngress(blockNumber)` on every RPC transport (http, ws, and the ipc socket). It returns `{"blockNumber", "sequenceNumber", "ingressUnixNanos"}` for the WebSocket frame that produced the block; `ingressUnixNanos` is the CLOCK_REALTIME stamp at the pre-parse ingress edge, as a decimal string because nanoseconds since the epoch exceed 2^53. A same-host consumer subtracts it from its own wall-clock stamps to measure cross-process, per-block latency. The result is `null` when the tracker has no entry: retention is ~16k blocks (about 27 minutes at ~10 blocks/s), and blocks recorded before the last restart or never seen on the websocket (L1-derived, replay, contention drops) have no stamp.
+
 ## Execute and persist loop
 
 These reth metrics describe the path arb-reth actually uses:
