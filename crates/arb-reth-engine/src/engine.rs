@@ -135,6 +135,7 @@ impl Drop for EngineTerminationGuard {
 }
 
 /// Produce one block and retain a breakdown of the local block-production work.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn produce_with_timing<'a>(
     evm_config: &ArbEvmConfig,
     chain_id: u64,
@@ -143,6 +144,7 @@ pub(crate) fn produce_with_timing<'a>(
     exec_state_provider: Box<dyn StateProvider + 'a>,
     trie_state_provider: Box<dyn StateProvider + 'a>,
     mut state_root_task: Option<PayloadStateRootHandle>,
+    push: Option<&tokio::sync::broadcast::Sender<crate::push::ExecutedBlock>>,
 ) -> eyre::Result<(
     BuiltPayloadExecutedBlock<ArbPrimitives>,
     ArbBlockProductionTiming,
@@ -293,6 +295,10 @@ pub(crate) fn produce_with_timing<'a>(
     let mut derived_transactions = Duration::ZERO;
     let mut derived_transaction_execution = Duration::ZERO;
     let mut derived_retry_scheduling = Duration::ZERO;
+    // Senders of COMMITTED txs, index-aligned with `builder.executor().receipts()`:
+    // both grow only on the success path below (a dropped-invalid tx `continue`s
+    // before either), which is what lets the executed-push zip them together.
+    let mut committed_senders: Vec<Address> = Vec::new();
     loop {
         let (tx, sender_result, is_internal) = if let Some(t) = first.take() {
             let sender = t.sender();
@@ -351,6 +357,7 @@ pub(crate) fn produce_with_timing<'a>(
             );
             continue;
         }
+        committed_senders.push(sender);
         let mut retry_scheduling = Duration::ZERO;
         if tx_success && !tx_logs.is_empty() {
             // FIFO, drained before the next user tx, matching Nitro's cascading-redeem order.
@@ -382,6 +389,45 @@ pub(crate) fn produce_with_timing<'a>(
             + start_block_transaction
             + derived_transactions,
     );
+
+    // Executed-push: the block's outcome is final here — everything below
+    // (state-root wait, assembly, canonicalization, newHeads) is bookkeeping a
+    // log consumer does not need to wait for. Payload construction is a few µs
+    // of copies; on live-feed nodes the launcher's frame_to_push metric task
+    // keeps receiver_count above zero permanently, so the gate only spares
+    // replay/L1-only nodes. `send` is a sync, non-blocking ring push. Never
+    // fails block production.
+    if let Some(push_tx) = push {
+        if push_tx.receiver_count() > 0 {
+            use alloy_consensus::TxReceipt as _;
+            use reth_evm::execute::BlockExecutor as _;
+            let receipts = builder.executor().receipts();
+            debug_assert_eq!(receipts.len(), committed_senders.len());
+            let txs = receipts
+                .iter()
+                .zip(committed_senders.iter())
+                .map(|(receipt, from)| crate::push::ExecutedTx {
+                    from: *from,
+                    status: receipt.status(),
+                    logs: receipt
+                        .logs()
+                        .iter()
+                        .map(|log| crate::push::PushLog {
+                            address: log.address,
+                            topics: log.topics().to_vec(),
+                            data: log.data.data.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            let _ = push_tx.send(crate::push::ExecutedBlock {
+                block_number: parent_header.number + 1,
+                sequence_number: feed_msg.sequence_number,
+                timestamp: next_timestamp,
+                txs,
+            });
+        }
+    }
     let phase_started_at = Instant::now();
 
     let finish_state_timings = Arc::new(FinishStateTimings::default());
@@ -1154,6 +1200,7 @@ where
         runtime: Runtime,
         tuning: ArbEngineTuning,
         prune_builder: Option<PrunerBuilder>,
+        push: Option<tokio::sync::broadcast::Sender<crate::push::ExecutedBlock>>,
     ) -> eyre::Result<Self> {
         // ---- persistence service (real MDBX writer; pruner from --prune.* flags) ----
         let (_finished_exex_height_tx, finished_exex_height_rx) =
@@ -1204,7 +1251,7 @@ where
             runtime.clone(),
         );
 
-        let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id);
+        let builder = ArbPayloadBuilder::new(provider.clone(), evm_config.clone(), chain_id, push);
         let generator = ArbPayloadJobGenerator::new(provider.clone(), runtime.clone(), builder);
         let (service, payload_builder) = PayloadBuilderService::<_, _, ArbPayloadTypes>::new(
             generator,

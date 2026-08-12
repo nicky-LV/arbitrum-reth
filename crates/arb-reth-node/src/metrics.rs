@@ -34,6 +34,10 @@ struct FeedLatencyMetrics {
     /// received2state: time from receiving a sequencer-feed WebSocket frame to canonical in-memory
     /// state. Both edges are local monotonic instants, so this half is exact.
     frame_to_canonical_seconds: Histogram,
+    /// received2push: time from receiving a sequencer-feed WebSocket frame to the executed-push
+    /// notification entering the broadcast channel (pre-canonical, before the state-root wait).
+    /// `frame_to_canonical` minus this is the post-execution tail the push skips.
+    frame_to_push_seconds: Histogram,
     /// WebSocket text/binary conversion and JSON decoding before a message is ready for the channel.
     frame_decode_seconds: Histogram,
     /// Channel send backpressure and time waiting in the driver input channel.
@@ -221,6 +225,25 @@ impl FeedLatencyTracker {
         };
         if let Some(timing) = messages.get_mut(&sequence_number) {
             timing.driver_dequeued_at = Some(dequeued_at);
+        }
+    }
+
+    /// Records the arrival of an executed-push notification for `sequence_number`, measured
+    /// against the frame's ws-ingress instant. Called from a metric-only push subscriber, so the
+    /// stamp includes the (µs-scale) broadcast hop — close enough to the emission edge. The
+    /// timing entry is still pending here (`record_canonical` runs later and removes it); a
+    /// missing entry (L1-derived catch-up, replay, evicted) is a normal skip, not an error.
+    pub(crate) fn record_push(&self, sequence_number: u64) {
+        let now = Instant::now();
+        let frame_received_at = match self.inner.messages.try_lock() {
+            Ok(messages) => messages.get(&sequence_number).map(|t| t.frame_received_at),
+            // Fail-soft like every recorder: never contend with the driver.
+            Err(_) => None,
+        };
+        if let Some(frame_received_at) = frame_received_at {
+            self.metrics()
+                .frame_to_push_seconds
+                .record(now.saturating_duration_since(frame_received_at).as_secs_f64());
         }
     }
 

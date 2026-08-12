@@ -26,6 +26,7 @@ use arbitrum_alloy_consensus::reth::ArbPrimitives;
 pub mod engine;
 pub mod engine_spike;
 pub mod native_payload;
+pub mod push;
 mod storage_v2;
 
 pub use engine::{ArbAppliedMessageTiming, ArbEngineDriver, ArbEngineTuning, wait_for_head};

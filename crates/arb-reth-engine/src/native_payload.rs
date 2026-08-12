@@ -41,15 +41,24 @@ pub struct ArbPayloadBuilder<P> {
     provider: P,
     evm_config: ArbEvmConfig,
     chain_id: u64,
+    /// Executed-push channel: block production emits into this the moment the
+    /// tx loop finishes, before the state-root wait (see [`crate::push`]).
+    push: Option<tokio::sync::broadcast::Sender<crate::push::ExecutedBlock>>,
 }
 
 impl<P> ArbPayloadBuilder<P> {
     /// Creates a payload builder over Reth's canonical/in-memory provider.
-    pub const fn new(provider: P, evm_config: ArbEvmConfig, chain_id: u64) -> Self {
+    pub fn new(
+        provider: P,
+        evm_config: ArbEvmConfig,
+        chain_id: u64,
+        push: Option<tokio::sync::broadcast::Sender<crate::push::ExecutedBlock>>,
+    ) -> Self {
         Self {
             provider,
             evm_config,
             chain_id,
+            push,
         }
     }
 
@@ -116,6 +125,7 @@ impl<P> ArbPayloadBuilder<P> {
             execution_state,
             trie_state,
             args.state_root_handle,
+            self.push.as_ref(),
         )
         .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err.to_string())))?;
         timing.parent_state = parent_state;

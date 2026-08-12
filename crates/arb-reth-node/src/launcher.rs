@@ -45,6 +45,7 @@ use tokio::sync::oneshot;
 
 use arbitrum_alloy_consensus::{ArbReceiptEnvelope, reth::ArbBlock};
 
+use arb_reth_engine::push::ExecutedBlock;
 use arb_reth_engine::{ArbEngineDriver, ArbEngineTuning};
 
 /// Handle returned by `ArbLauncher` after the node has been launched.
@@ -315,6 +316,15 @@ impl ArbLauncher {
         let arb_evm_config: arb_reth_evm::ArbEvmConfig =
             ctx.node_adapter().components.evm_config().clone();
 
+        // Executed-push channel: block production sends a pre-canonical
+        // per-block notification (see `arb_reth_engine::push`) that the
+        // `arb_subscribeExecuted` RPC subscription fans out to consumers.
+        // Ring of 64 ≈ 6s of blocks; a lagging subscriber loses old entries
+        // (it must heal via newHeads), it never backpressures production.
+        let (push_tx, _) = tokio::sync::broadcast::channel::<ExecutedBlock>(64);
+        let rpc_push_tx = push_tx.clone();
+        let metric_push_rx = push_tx.subscribe();
+
         // Stand up reth's engine tree (Tier-1 `InsertExecutedBlock` seam) and drive the
         // sequencer feed through it. Persistence to MDBX is async (tree background service).
         let mut driver: ArbEngineDriver<NodeTypesWithDBAdapter<N, DB>> = ArbEngineDriver::spawn(
@@ -328,6 +338,7 @@ impl ArbLauncher {
             task_executor.clone(),
             tuning,
             prune_config.map(reth_prune::PrunerBuilder::new),
+            Some(push_tx),
         )?;
 
         let (exit_tx, exit_rx) = oneshot::channel::<eyre::Result<()>>();
@@ -336,6 +347,23 @@ impl ArbLauncher {
         // The driver task below takes `feed_latency`; keep a handle for the RPC hook so
         // `arb_getFeedIngress` can serve the retained ingress stamps out of the same tracker.
         let rpc_feed_latency = feed_latency.clone();
+
+        // frame→push observability: one subscriber that stamps each push
+        // against the frame's ws-ingress instant (still pending in the
+        // tracker — the push fires before record_canonical moves it to the
+        // ring). Skipped entries (L1-derived catch-up, replay) are normal.
+        if let Some(tracker) = feed_latency.clone() {
+            let mut rx = metric_push_rx;
+            task_executor.spawn_task(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => tracker.record_push(ev.sequence_number),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
 
         task_executor.spawn_critical_task("arb-engine-driver", async move {
             let res: eyre::Result<()> = async {
@@ -446,34 +474,82 @@ impl ArbLauncher {
                     // join: a consumer subtracts it from its own wall-clock send stamp for the
                     // same block. Only a live feed has ingress stamps, so replay/L1-only nodes
                     // (tracker absent) serve no method rather than a method of nulls.
-                    let Some(tracker) = rpc_feed_latency else {
-                        return Ok(());
-                    };
-                    let mut module = jsonrpsee::RpcModule::new(tracker);
-                    module.register_method("arb_getFeedIngress", |params, tracker, _| {
-                        let block_number: u64 = params.one()?;
-                        let Some((received_wall, sequence_number)) =
-                            tracker.feed_ingress(block_number)
-                        else {
-                            // Evicted, pre-restart, or never tracked: an absent join key is a
-                            // normal outcome for the consumer, not an error.
-                            return Ok(None);
-                        };
-                        // Nanos-since-epoch exceeds 2^53, so a JSON number would lose precision
-                        // in double-parsing clients; serve a decimal string. A pre-1970 clock
-                        // has no representable stamp, so it reads as absent too.
-                        let Ok(since_epoch) = received_wall.duration_since(UNIX_EPOCH) else {
-                            return Ok(None);
-                        };
-                        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(Some(serde_json::json!({
-                            "blockNumber": block_number,
-                            "sequenceNumber": sequence_number,
-                            "ingressUnixNanos": since_epoch.as_nanos().to_string(),
-                        })))
-                    })?;
-                    // Every configured transport: the low-latency consumer reads over the ipc
-                    // socket, while http/ws keep the method reachable for manual inspection.
-                    ctx.modules.merge_configured(module)?;
+                    if let Some(tracker) = rpc_feed_latency {
+                        let mut module = jsonrpsee::RpcModule::new(tracker);
+                        module.register_method("arb_getFeedIngress", |params, tracker, _| {
+                            let block_number: u64 = params.one()?;
+                            let Some((received_wall, sequence_number)) =
+                                tracker.feed_ingress(block_number)
+                            else {
+                                // Evicted, pre-restart, or never tracked: an absent join key is
+                                // a normal outcome for the consumer, not an error.
+                                return Ok(None);
+                            };
+                            // Nanos-since-epoch exceeds 2^53, so a JSON number would lose
+                            // precision in double-parsing clients; serve a decimal string. A
+                            // pre-1970 clock has no representable stamp, so it reads as absent.
+                            let Ok(since_epoch) = received_wall.duration_since(UNIX_EPOCH) else {
+                                return Ok(None);
+                            };
+                            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(Some(serde_json::json!({
+                                "blockNumber": block_number,
+                                "sequenceNumber": sequence_number,
+                                "ingressUnixNanos": since_epoch.as_nanos().to_string(),
+                            })))
+                        })?;
+                        // Every configured transport: the low-latency consumer reads over the
+                        // ipc socket, while http/ws keep the method reachable for inspection.
+                        ctx.modules.merge_configured(module)?;
+                    }
+
+                    // `arb_subscribeExecuted`: the pre-canonical executed-block push (see
+                    // `arb_reth_engine::push`). Notifications carry the block's receipts in
+                    // `eth_getBlockReceipts` shape the moment execution finishes — before the
+                    // state-root wait, canonicalization and newHeads. Registered on every
+                    // transport; subscriptions are servable over ws/ipc (an http call gets
+                    // jsonrpsee's "subscriptions not supported" error, which is fine).
+                    let mut sub_module = jsonrpsee::RpcModule::new(rpc_push_tx);
+                    sub_module.register_subscription(
+                        "arb_subscribeExecuted",
+                        // Notification method name. alloy routes notifications purely by
+                        // subscription id and never inspects this; named for human readers.
+                        "arb_subscription",
+                        "arb_unsubscribeExecuted",
+                        |_params, pending, push_tx, _ext| async move {
+                            let sink = pending.accept().await?;
+                            let mut rx = push_tx.subscribe();
+                            loop {
+                                tokio::select! {
+                                    _ = sink.closed() => break,
+                                    item = rx.recv() => match item {
+                                        Ok(ev) => {
+                                            let msg = jsonrpsee::SubscriptionMessage::new(
+                                                sink.method_name(),
+                                                sink.subscription_id(),
+                                                &ev,
+                                            )?;
+                                            if sink.send(msg).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        // A slow subscriber loses old entries rather than
+                                        // backpressuring the payload thread; it must heal from
+                                        // newHeads. Keep the subscription alive.
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                            tracing::warn!(
+                                                target: "arb-reth::push",
+                                                skipped = n,
+                                                "executed-push subscriber lagged; entries dropped",
+                                            );
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                    },
+                                }
+                            }
+                            Ok::<(), jsonrpsee::core::SubscriptionError>(())
+                        },
+                    )?;
+                    ctx.modules.merge_configured(sub_module)?;
                     Ok(())
                 })
                 .launch_add_ons(add_ons_ctx)
