@@ -435,6 +435,28 @@ impl FeedLatencyTracker {
         }
     }
 
+    /// The ingress wall clock for a sequence number, served from the LIVE `messages` map.
+    ///
+    /// The difference from [`Self::feed_ingress`] is when it can answer, and it is the whole
+    /// point of this method: `ingress_by_block` is not written until `record_canonical`, which
+    /// on this node runs ~22ms after the frame — so a consumer that reacts to the executed
+    /// push (~3.6ms after the frame) always misses it and its staleness gate fails open.
+    /// `messages` is written at `record_frame_arrival`, before production even starts, so this
+    /// lookup is warm for exactly the window the push occupies.
+    ///
+    /// Keyed by SEQUENCE NUMBER because that is what the push carries and what `messages` is
+    /// keyed by; the block-number join in `feed_ingress` exists for the RPC method, whose
+    /// callers only know a block.
+    ///
+    /// `None` = the frame was never tracked (contention drop, L1-derived, pre-restart) or has
+    /// already completed and been forgotten. Absent is a normal outcome, not an error.
+    pub fn frame_ingress_wall(&self, sequence_number: u64) -> Option<SystemTime> {
+        // try_lock, not lock: this runs on the push fan-out path, and a stamp is a diagnostic.
+        // Blocking the notification to attach latency metadata would be a self-defeating trade.
+        let messages = self.inner.messages.try_lock().ok()?;
+        messages.get(&sequence_number).map(|t| t.frame_received_wall)
+    }
+
     /// The retained ingress edge for `block_number`: the wall clock at which the frame that
     /// produced the block hit the websocket, and its feed sequence number. `None` once the block
     /// has aged out of the retention window, or if its frame was never tracked (contention drop,

@@ -474,7 +474,9 @@ impl ArbLauncher {
                     // join: a consumer subtracts it from its own wall-clock send stamp for the
                     // same block. Only a live feed has ingress stamps, so replay/L1-only nodes
                     // (tracker absent) serve no method rather than a method of nulls.
-                    if let Some(tracker) = rpc_feed_latency {
+                    // Cloned, not moved: the executed-push registration below needs the same
+                    // tracker to stamp its notifications.
+                    if let Some(tracker) = rpc_feed_latency.clone() {
                         let mut module = jsonrpsee::RpcModule::new(tracker);
                         module.register_method("arb_getFeedIngress", |params, tracker, _| {
                             let block_number: u64 = params.one()?;
@@ -508,21 +510,45 @@ impl ArbLauncher {
                     // state-root wait, canonicalization and newHeads. Registered on every
                     // transport; subscriptions are servable over ws/ipc (an http call gets
                     // jsonrpsee's "subscriptions not supported" error, which is fine).
-                    let mut sub_module = jsonrpsee::RpcModule::new(rpc_push_tx);
+                    // State is (channel, tracker): the tracker is what stamps each
+                    // notification with its frame's ws-ingress wall clock on the way out.
+                    // Done HERE rather than at the send site in block production because
+                    // this is the only place that has both, and because it keeps the
+                    // engine crate free of a dependency on node-side latency plumbing.
+                    let mut sub_module =
+                        jsonrpsee::RpcModule::new((rpc_push_tx, rpc_feed_latency.clone()));
                     sub_module.register_subscription(
                         "arb_subscribeExecuted",
                         // Notification method name. alloy routes notifications purely by
                         // subscription id and never inspects this; named for human readers.
                         "arb_subscription",
                         "arb_unsubscribeExecuted",
-                        |_params, pending, push_tx, _ext| async move {
+                        |_params, pending, state, _ext| async move {
+                            let (push_tx, feed_latency) = &*state;
                             let sink = pending.accept().await?;
                             let mut rx = push_tx.subscribe();
                             loop {
                                 tokio::select! {
                                     _ = sink.closed() => break,
                                     item = rx.recv() => match item {
-                                        Ok(ev) => {
+                                        Ok(mut ev) => {
+                                            // Stamp the notification with the wall clock at
+                                            // which this block's frame hit our websocket, so
+                                            // a consumer can measure ingress→wire without a
+                                            // round trip it does not have time to make. Read
+                                            // from the live `messages` map: the canonical
+                                            // ring this block will land in is not written
+                                            // until ~22ms from now, and the consumer acts in
+                                            // ~2ms. Absent stays absent — never fabricated.
+                                            ev.feed_ingress_unix_nanos = feed_latency
+                                                .as_ref()
+                                                .and_then(|t| {
+                                                    t.frame_ingress_wall(ev.sequence_number)
+                                                })
+                                                .and_then(|w| {
+                                                    w.duration_since(UNIX_EPOCH).ok()
+                                                })
+                                                .map(|d| d.as_nanos().to_string());
                                             let msg = jsonrpsee::SubscriptionMessage::new(
                                                 sink.method_name(),
                                                 sink.subscription_id(),

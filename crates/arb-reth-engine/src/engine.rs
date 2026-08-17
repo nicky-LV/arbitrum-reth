@@ -424,6 +424,10 @@ pub(crate) fn produce_with_timing<'a>(
                 block_number: parent_header.number + 1,
                 sequence_number: feed_msg.sequence_number,
                 timestamp: next_timestamp,
+                // Filled in on the fan-out path, which is where the feed-latency tracker
+                // lives (this crate has no dependency on it, and should not grow one for a
+                // diagnostic). See the `arb_subscribeExecuted` registration in the launcher.
+                feed_ingress_unix_nanos: None,
                 txs,
             });
         }

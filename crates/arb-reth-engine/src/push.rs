@@ -52,5 +52,23 @@ pub struct ExecutedBlock {
     /// Feed sequence number — the join key for `arb_getFeedIngress`.
     pub sequence_number: u64,
     pub timestamp: u64,
+    /// CLOCK_REALTIME nanos-since-epoch at which this block's feed frame hit the node's
+    /// websocket — the same edge `arb_getFeedIngress` serves, delivered INLINE.
+    ///
+    /// Exists because the RPC form cannot answer in time. `arb_getFeedIngress` reads a map
+    /// written at canonicalization (~22ms after the frame on this node), while a consumer
+    /// reacting to this push acts ~2ms after receiving it — so every lookup missed, and a
+    /// consumer gating on "how stale is this opportunity" failed open on exactly the fast
+    /// sends the gate exists to judge. Carried here, the number is available at decision time
+    /// with no round trip and no cache.
+    ///
+    /// A DECIMAL STRING, not a number: nanos-since-epoch exceeds 2^53 and would lose precision
+    /// in any double-parsing client. Same convention as `arb_getFeedIngress`.
+    ///
+    /// `None` (field omitted) when the frame was not tracked — L1-derived catch-up, replay, a
+    /// contention drop, or a node without the latency tracker. A consumer must treat absence as
+    /// "unknown", never as "zero latency".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feed_ingress_unix_nanos: Option<String>,
     pub txs: Vec<ExecutedTx>,
 }
